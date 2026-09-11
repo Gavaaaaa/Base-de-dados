@@ -1,0 +1,1675 @@
+diff --git a/app/crai/ml/anomaly_detector.py b/app/crai/ml/anomaly_detector.py
+index 8236b3c..0c57eee 100644
+--- a/app/crai/ml/anomaly_detector.py
++++ b/app/crai/ml/anomaly_detector.py
+@@ -9,6 +9,7 @@ Produção: autoencoder treinado por train(), com artefatos em crai/models/.
+ """
+ 
+ import json
++from datetime import datetime
+ from pathlib import Path
+ 
+ import joblib
+@@ -21,8 +22,11 @@ from sklearn.metrics import (
+ from sklearn.model_selection import train_test_split
+ from sklearn.preprocessing import StandardScaler
+ 
++from . import calibracao
++from .calibracao import conferir_meta
+ from .synthetic_data import (
+     BEHAVIORAL_FEATURES,
++    _behavioral_population,
+     generate_behavioral_dataset,
+     seed_por_cliente,
+ )
+@@ -73,6 +77,12 @@ class AnomalyDetector:
+         self.threshold = None
+         self.features = BEHAVIORAL_FEATURES
+         self._train_metrics: dict = {}
++        self.meta: dict = {}
++        # Fonte com que o artefato carregado/treinado foi gerado. Decide como
++        # `_behavioral_snapshot` simula o cliente na inferência: um modelo
++        # treinado com parâmetros calibrados precisa de um snapshot na mesma
++        # escala, senão TODO cliente vira anomalia. "sintetico" = caminho antigo.
++        self._fonte = "sintetico"
+ 
+     # ══════════════════════════════════════════════════════════════════════
+     # TREINO
+@@ -90,6 +100,7 @@ class AnomalyDetector:
+         patience: int = 10,
+         threshold_percentile: float = 95.0,
+         seed: int = 42,
++        fonte: str = "sintetico",
+     ) -> dict:
+         """
+         Treina o autoencoder em dataset comportamental sintético e retorna métricas.
+@@ -111,10 +122,14 @@ class AnomalyDetector:
+             patience: Épocas sem melhora antes do early stopping
+             threshold_percentile: Percentil do erro dos saudáveis que vira threshold
+             seed: Seed para reprodutibilidade
++            fonte: "sintetico" (default, inalterado) ou "sintetico_calibrado"
++                   (parâmetros medidos em doadores reais + exceções ao rótulo)
+ 
+         Returns:
+-            Dicionário com métricas de treino (ROC-AUC, precision/recall, threshold)
++            Dicionário com métricas de treino (ROC-AUC, precision/recall, threshold),
++            mais `fonte_usada`, `n_amostras`, `proveniencia` e `versoes`.
+         """
++        calibracao.validar_fonte(fonte)
+         if not TORCH_AVAILABLE:
+             raise RuntimeError(
+                 "PyTorch não instalado — necessário para treinar o autoencoder "
+@@ -124,11 +139,12 @@ class AnomalyDetector:
+         torch.manual_seed(seed)
+         np.random.seed(seed)
+ 
+-        print("[ANOMALY] Gerando dataset comportamental sintético...")
++        print(f"[ANOMALY] Gerando dataset comportamental sintético (fonte={fonte})...")
+         df = generate_behavioral_dataset(
+-            n_samples=n_samples, anomaly_rate=anomaly_rate, seed=seed
++            n_samples=n_samples, anomaly_rate=anomaly_rate, seed=seed, fonte=fonte
+         )
+         self.features = list(BEHAVIORAL_FEATURES)
++        self._fonte = fonte
+ 
+         saudaveis = df[df["is_anomalous"] == 0]
+         anomalos = df[df["is_anomalous"] == 1]
+@@ -159,6 +175,11 @@ class AnomalyDetector:
+ 
+         metrics = self._evaluate(X_val_s, X_anomalous, threshold_percentile, historico)
+         metrics["n_train_healthy"] = int(len(X_train))
++        metrics["fonte_usada"] = fonte
++        metrics["n_amostras"] = int(n_samples)
++        metrics["proveniencia"] = calibracao.resumo_proveniencia("AnomalyDetector", fonte)
++        metrics["versoes"] = calibracao.versoes_bibliotecas()
++        metrics["treinado_em"] = datetime.now().isoformat(timespec="seconds")
+         self._train_metrics = metrics
+         self.is_fitted = True
+ 
+@@ -305,7 +326,15 @@ class AnomalyDetector:
+             "n_anomalos_avaliacao": metrics["n_anomalous"],
+             "roc_auc": metrics["roc_auc"],
+             "seed": seed,
++            "modelo": "AnomalyDetector",
++            "algoritmo": "autoencoder denso 12-32-16-4-16-32-12 (PyTorch)",
++            "fonte_usada": metrics["fonte_usada"],
++            "n_amostras": metrics["n_amostras"],
++            "proveniencia": metrics["proveniencia"],
++            "versoes": metrics["versoes"],
++            "treinado_em": metrics["treinado_em"],
+         }
++        self.meta = meta
+         with open(MODELS_DIR / "autoencoder_meta.json", "w", encoding="utf-8") as f:
+             json.dump(meta, f, indent=2, ensure_ascii=False)
+ 
+@@ -329,6 +358,8 @@ class AnomalyDetector:
+             self.model.load_state_dict(torch.load(MODELS_DIR / "autoencoder.pt"))
+             self.model.eval()
+             self.scaler = joblib.load(MODELS_DIR / "autoencoder_scaler.pkl")
++            self.meta = conferir_meta(MODELS_DIR / "autoencoder_meta.json", "ANOMALY")
++            self._fonte = self.meta.get("fonte_usada", "sintetico")
+ 
+             self.is_fitted = True
+             print(f"[ANOMALY] Autoencoder carregado de {MODELS_DIR}/ (threshold={self.threshold:.4f})")
+@@ -377,10 +408,22 @@ class AnomalyDetector:
+ 
+         Determinístico por customer_id: ~15% dos clientes exibem o padrão
+         degradado (queda de uso, fricção alta) usado no treino como anomalia.
++
++        Com um artefato treinado em fonte="sintetico_calibrado", o snapshot é
++        sorteado com os MESMOS parâmetros calibrados do treino (via
++        `_behavioral_population`), senão a escala não bate e o autoencoder
++        marca todo mundo como anômalo. O caminho default é o de sempre.
+         """
+         rng = np.random.default_rng(seed=seed_por_cliente(customer_id))
+         degradado = rng.uniform() < 0.15
+ 
++        if self._fonte != "sintetico":
++            P = calibracao.parametros(self._fonte)["behavioral"]
++            linha = _behavioral_population(1, rng, anomalous=bool(degradado), parametros=P)
++            return {f: (float(linha.at[0, f]) if f in ("mrr_brl", "feature_adoption",
++                                                      "avg_session_min", "nps_last")
++                        else int(linha.at[0, f])) for f in BEHAVIORAL_FEATURES}
++
+         seats = int(np.clip(rng.poisson(lam=15), 1, 200))
+         if degradado:
+             logins_30d = int(max(0, rng.normal(loc=seats * 5, scale=seats * 2)))
+diff --git a/app/crai/ml/failure_classifier.py b/app/crai/ml/failure_classifier.py
+index 51c9dc2..a87fc16 100644
+--- a/app/crai/ml/failure_classifier.py
++++ b/app/crai/ml/failure_classifier.py
+@@ -33,7 +33,9 @@ from sklearn.preprocessing import LabelEncoder
+ from xgboost import XGBClassifier
+ 
+ from ..config import CUSTOS_PADRAO, custo_intervencao, custos_por_canal
+-from .synthetic_data import generate_dataset
++from . import calibracao
++from .calibracao import conferir_meta
++from .synthetic_data import SEED, generate_dataset
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -190,24 +192,37 @@ class FailureClassifier:
+         self._xgb_explainer: Optional[shap.TreeExplainer] = None
+         self._rf_explainer: Optional[shap.TreeExplainer] = None
+         self._train_metrics: dict = {}
++        self.meta: dict = {}
+ 
+     # ══════════════════════════════════════════════════════════════════════
+     # TREINO
+     # ══════════════════════════════════════════════════════════════════════
+ 
+-    def train(self, n_samples: int = 3000, test_size: float = 0.2) -> dict:
++    def train(self, n_samples: int = 3000, test_size: float = 0.2,
++              fonte: str = "sintetico", seed: int = SEED) -> dict:
+         """
+         Treina o ensemble em dataset sintético e retorna métricas.
+ 
+         Args:
+             n_samples: Tamanho do dataset sintético
+             test_size: Fração para teste
++            fonte: "sintetico" (default — o gerador de sempre, saída idêntica
++                   à de antes deste parâmetro existir) ou "sintetico_calibrado"
++                   (parâmetros medidos em doadores reais, `models/calibracao.json`)
++            seed: seed do GERADOR (default 42, o de sempre). O split e os
++                  modelos continuam com random_state=42 — o parâmetro existe
++                  para a curva de volume (`scripts/sanity_check_fora_do_dominio`)
++                  medir variância entre datasets, não para mudar o default.
+ 
+         Returns:
+-            Dicionário com métricas de treino (AUC, report, e-Profit médio)
++            Dicionário com métricas de treino (AUC, report, e-Profit médio),
++            mais `fonte_usada`, `n_amostras`, `proveniencia` (quais features
++            são ancoradas em real vs. sintéticas puras) e `versoes` das
++            bibliotecas usadas neste treino.
+         """
+-        print("[CLASSIFIER] Gerando dataset sintético...")
+-        df = generate_dataset(n_samples=n_samples)
++        calibracao.validar_fonte(fonte)
++        print(f"[CLASSIFIER] Gerando dataset sintético (fonte={fonte})...")
++        df = generate_dataset(n_samples=n_samples, seed=seed, fonte=fonte)
+ 
+         # Separar LTV antes de preparar features (não entra no treino)
+         ltv_series = df["ltv_estimated"].copy()
+@@ -241,7 +256,32 @@ class FailureClassifier:
+ 
+         # Calcular métricas no conjunto de teste
+         metrics = self._evaluate(X_test, y_test, ltv_test)
++
++        # Rastreabilidade do treino: de onde veio o dado, quanto dado, quais
++        # features têm doador real e com que versão de biblioteca o binário
++        # foi gravado. Vai no retorno E no meta.json ao lado do .joblib.
++        metrics["fonte_usada"] = fonte
++        metrics["n_amostras"] = int(n_samples)
++        metrics["n_treino"] = int(len(X_train))
++        metrics["n_teste"] = int(len(X_test))
++        metrics["proveniencia"] = calibracao.resumo_proveniencia("FailureClassifier", fonte)
++        metrics["versoes"] = calibracao.versoes_bibliotecas()
++        metrics["treinado_em"] = datetime.now().isoformat(timespec="seconds")
+         self._train_metrics = metrics
++        self.meta = {
++            "modelo": "FailureClassifier",
++            "algoritmo": "XGBClassifier (0,7) + RandomForestClassifier (0,3)",
++            "features": self.feature_names,
++            "fonte_usada": fonte,
++            "n_amostras": int(n_samples),
++            "n_treino": int(len(X_train)),
++            "n_teste": int(len(X_test)),
++            "auc": metrics["auc"],
++            "limiar_classificacao": LIMIAR_CLASSIFICACAO,
++            "proveniencia": metrics["proveniencia"],
++            "versoes": metrics["versoes"],
++            "treinado_em": metrics["treinado_em"],
++        }
+ 
+         # Salvar modelos
+         self._save_models()
+@@ -685,6 +725,11 @@ class FailureClassifier:
+         with open(MODELS_DIR / "train_metrics.json", "w", encoding="utf-8") as f:
+             json.dump(self._train_metrics, f, ensure_ascii=False, indent=2, default=str)
+ 
++        # meta.json: fonte, volume, proveniência e versões — o mesmo contrato
++        # dos módulos 2 e 3 (`autoencoder_meta.json`, `payday_meta.json`).
++        with open(MODELS_DIR / "failure_classifier_meta.json", "w", encoding="utf-8") as f:
++            json.dump(self.meta, f, ensure_ascii=False, indent=2, default=str)
++
+         print(f"[CLASSIFIER] Modelos salvos em {MODELS_DIR}/")
+ 
+     def load(self) -> bool:
+@@ -698,6 +743,8 @@ class FailureClassifier:
+             self._xgb_explainer = shap.TreeExplainer(self.xgb)
+             self._rf_explainer = shap.TreeExplainer(self.rf)
+ 
++            self.meta = conferir_meta(MODELS_DIR / "failure_classifier_meta.json", "CLASSIFIER")
++
+             self.is_fitted = True
+             print(f"[CLASSIFIER] Modelos carregados de {MODELS_DIR}/")
+             return True
+diff --git a/app/crai/ml/payday_inference.py b/app/crai/ml/payday_inference.py
+index 8ab20ce..edce2b9 100644
+--- a/app/crai/ml/payday_inference.py
++++ b/app/crai/ml/payday_inference.py
+@@ -18,6 +18,8 @@ import numpy as np
+ import pandas as pd
+ from sklearn.metrics import roc_auc_score
+ 
++from . import calibracao
++from .calibracao import conferir_meta
+ from .synthetic_data import generate_liquidity_series, seed_por_cliente
+ 
+ try:
+@@ -83,6 +85,7 @@ class PaydayInference:
+         self.model = None
+         self.priors = {}
+         self._train_metrics: dict = {}
++        self.meta: dict = {}
+ 
+     # ══════════════════════════════════════════════════════════════════════
+     # TREINO
+@@ -99,6 +102,7 @@ class PaydayInference:
+         hidden_size: int = 64,
+         patience: int = 6,
+         seed: int = 42,
++        fonte: str = "sintetico",
+     ) -> dict:
+         """
+         Treina a LSTM de liquidez + os Prophets por perfil e retorna métricas.
+@@ -118,10 +122,15 @@ class PaydayInference:
+             hidden_size: Unidades ocultas da LSTM
+             patience: Épocas sem melhora antes do early stopping
+             seed: Seed para reprodutibilidade
++            fonte: "sintetico" (default, inalterado) ou "sintetico_calibrado"
++                   (mesmas séries + choques anti-circularidade; não há doador
++                   real para saldo diário — ver calibracao.json)
+ 
+         Returns:
+-            Dicionário com métricas (ROC-AUC diário, MAE da janela ótima vs heurística)
++            Dicionário com métricas (ROC-AUC diário, MAE da janela ótima vs heurística),
++            mais `fonte_usada`, `n_amostras`, `proveniencia` e `versoes`.
+         """
++        calibracao.validar_fonte(fonte)
+         if not TORCH_AVAILABLE or not PROPHET_AVAILABLE:
+             raise RuntimeError(
+                 "torch e prophet são necessários para treinar o módulo de liquidez "
+@@ -131,8 +140,9 @@ class PaydayInference:
+         torch.manual_seed(seed)
+         np.random.seed(seed)
+ 
+-        print("[PAYDAY] Gerando séries de liquidez sintéticas...")
+-        df = generate_liquidity_series(n_customers=n_samples, n_days=n_days, seed=seed)
++        print(f"[PAYDAY] Gerando séries de liquidez sintéticas (fonte={fonte})...")
++        df = generate_liquidity_series(n_customers=n_samples, n_days=n_days, seed=seed,
++                                       fonte=fonte)
+ 
+         rng = np.random.default_rng(seed)
+         clientes = np.sort(df["customer_id"].unique())
+@@ -173,6 +183,11 @@ class PaydayInference:
+         metrics = self._evaluate(df_teste, historico)
+         metrics["n_clientes_treino"] = len(clientes_treino)
+         metrics["n_janelas_treino"] = int(len(X_tr))
++        metrics["fonte_usada"] = fonte
++        metrics["n_amostras"] = int(n_samples)
++        metrics["proveniencia"] = calibracao.resumo_proveniencia("PaydayInference", fonte)
++        metrics["versoes"] = calibracao.versoes_bibliotecas()
++        metrics["treinado_em"] = datetime.now().isoformat(timespec="seconds")
+         self._train_metrics = metrics
+ 
+         self._save_models(hidden_size, seed, metrics)
+@@ -449,7 +464,15 @@ class PaydayInference:
+             "roc_auc_ensemble": metrics["roc_auc_ensemble"],
+             "mae_dias_ensemble": metrics["mae_dias_ensemble"],
+             "seed": seed,
++            "modelo": "PaydayInference",
++            "algoritmo": "LSTM seq2vec (PyTorch) 0,6 + Prophet por perfil 0,4",
++            "fonte_usada": metrics["fonte_usada"],
++            "n_amostras": metrics["n_amostras"],
++            "proveniencia": metrics["proveniencia"],
++            "versoes": metrics["versoes"],
++            "treinado_em": metrics["treinado_em"],
+         }
++        self.meta = meta
+         with open(MODELS_DIR / "payday_meta.json", "w", encoding="utf-8") as f:
+             json.dump(meta, f, indent=2, ensure_ascii=False)
+ 
+@@ -464,6 +487,7 @@ class PaydayInference:
+         try:
+             with open(MODELS_DIR / "payday_meta.json", encoding="utf-8") as f:
+                 meta = json.load(f)
++            self.meta = conferir_meta(MODELS_DIR / "payday_meta.json", "PAYDAY")
+             self.model = LiquidityLSTM(hidden_size=meta["hidden_size"])
+             self.model.load_state_dict(torch.load(MODELS_DIR / "payday_lstm.pt"))
+             self.model.eval()
+diff --git a/app/crai/ml/synthetic_data.py b/app/crai/ml/synthetic_data.py
+index 5250f9d..9b711cd 100644
+--- a/app/crai/ml/synthetic_data.py
++++ b/app/crai/ml/synthetic_data.py
+@@ -13,6 +13,20 @@ Todos geram dados plausíveis para o mercado brasileiro de SaaS B2B:
+ - Códigos de falha de gateway com distribuição desbalanceada
+ - LTV estimado para cálculo do e-Profit
+ - Seed fixa (42) para reprodutibilidade
++
++Fonte dos parâmetros (`fonte=`, em todos os geradores):
++
++- "sintetico" (default): os valores inventados de sempre, agora reunidos em
++  `calibracao.PARAMETROS_DISTRIBUICAO`. Saída byte-idêntica à de antes —
++  `tests/test_synthetic_data.py` trava o hash.
++- "sintetico_calibrado": os mesmos geradores com os parâmetros MEDIDOS em
++  doadores reais (`models/calibracao.json`), mais o ruído anti-circularidade
++  descrito em cada gerador. Ver `calibracao.py` e `docs/DATA_CARD.md`.
++
++Há um quarto gerador, `generate_voluntary_dataset()`, para o risk_scorer do
++churn voluntário — o rótulo dele são as regras fixas do próprio scorer, com
++ruído, e é só isso que ele pode ser enquanto não existe sinal real de
++cancelamento (ver `churn_voluntary/README_treino.md`).
+ """
+ 
+ import hashlib
+@@ -22,12 +36,24 @@ from typing import Optional, Union
+ import numpy as np
+ 
+ from .ltv import ltv_estimado
++from . import calibracao as _calibracao
+ import pandas as pd
+ 
+ # Seed global para reprodutibilidade
+ SEED = 42
+ 
+ 
++def _parametros(fonte: str, parametros: Optional[dict], bloco: str) -> dict:
++    """O bloco de parâmetros do gerador (`classifier`, `behavioral`...).
++
++    `parametros` explícito vence `fonte` — é o caminho dos testes, que
++    injetam um dicionário sem depender do arquivo em disco.
++    """
++    if parametros is not None:
++        return parametros[bloco] if bloco in parametros else parametros
++    return _calibracao.parametros(fonte)[bloco]
++
++
+ def seed_por_cliente(customer_id: str) -> int:
+     """Seed determinística por cliente, estável entre execuções.
+ 
+@@ -83,17 +109,25 @@ LIQUIDITY_PROFILES = ["CLT", "PJ", "freelancer"]
+ LIQUIDITY_PROFILE_PROBS = [0.50, 0.30, 0.20]
+ 
+ 
+-def generate_dataset(n_samples: int = 3000, seed: Optional[int] = SEED) -> pd.DataFrame:
++def generate_dataset(
++    n_samples: int = 3000,
++    seed: Optional[int] = SEED,
++    fonte: str = "sintetico",
++    parametros: Optional[dict] = None,
++) -> pd.DataFrame:
+     """
+     Gera dataset sintético com distribuições plausíveis para SaaS B2B brasileiro.
+ 
+     Args:
+         n_samples: Número de amostras (default 3000)
+         seed: Seed para reprodutibilidade (default 42)
++        fonte: "sintetico" (default, inalterado) ou "sintetico_calibrado"
++        parametros: bloco `classifier` de parâmetros, se quiser injetar um
+ 
+     Returns:
+         DataFrame com features e target 'recovered'
+     """
++    P = _parametros(fonte, parametros, "classifier")
+     rng = np.random.default_rng(seed)
+ 
+     # ── Tenure (meses de casa) ───────────────────────────────────────
+@@ -106,28 +140,41 @@ def generate_dataset(n_samples: int = 3000, seed: Optional[int] = SEED) -> pd.Da
+     tenure_months = np.clip(tenure_all[:n_samples], 0, 72).astype(int)
+ 
+     # ── Dia do mês da cobrança ───────────────────────────────────────
+-    # Sazonalidade brasileira: concentração nos dias 5, 10, 15, 30
+-    peak_days = [5, 10, 15, 20, 30]
+-    day_of_month = np.zeros(n_samples, dtype=int)
+-    for i in range(n_samples):
+-        if rng.random() < 0.6:  # 60% nos dias de pico
+-            day_of_month[i] = rng.choice(peak_days)
+-        else:
+-            day_of_month[i] = rng.integers(1, 29)
++    # Default: sazonalidade desenhada à mão (picos nos dias 5, 10, 15, 20, 30).
++    # Calibrado: histograma empírico do dia do mês nas 300 transações reais
++    # da Olist (Fonte A), lido de calibracao.json.
++    if P["day_of_month_hist"] is None:
++        peak_days = list(P["peak_days"])
++        day_of_month = np.zeros(n_samples, dtype=int)
++        for i in range(n_samples):
++            if rng.random() < P["p_peak_day"]:  # 60% nos dias de pico
++                day_of_month[i] = rng.choice(peak_days)
++            else:
++                day_of_month[i] = rng.integers(1, 29)
++    else:
++        hist = np.asarray(P["day_of_month_hist"], dtype=float)
++        day_of_month = rng.choice(np.arange(1, len(hist) + 1), size=n_samples,
++                                  p=hist / hist.sum())
+ 
+     # ── Valor da fatura (LogNormal) ──────────────────────────────────
+-    # SaaS B2B brasileiro: R$99 a R$5000, concentração em R$200-R$800
++    # Default: mean=5.8, sigma=0.7 (palpite: R$200-R$800). Calibrado: MLE
++    # sobre `payment_value` das 300 reais (mu=4.58, sigma=0.89 — mediana
++    # R$ 100, ticket de e-commerce; ver DATA_CARD 2.3 sobre o custo disso).
+     invoice_amount = np.clip(
+-        rng.lognormal(mean=5.8, sigma=0.7, size=n_samples),
+-        49.90, 9999.90
++        rng.lognormal(mean=P["invoice_lognormal"]["mean"],
++                      sigma=P["invoice_lognormal"]["sigma"], size=n_samples),
++        P["invoice_clip"][0], P["invoice_clip"][1]
+     ).round(2)
+ 
+     # ── Ticket médio (correlacionado com fatura, com ruído) ──────────
+     avg_ticket = (invoice_amount * rng.uniform(0.85, 1.15, size=n_samples)).round(2)
+ 
+     # ── Código de erro do gateway ────────────────────────────────────
++    # Calibrado: a fatia de `insufficient_funds` é escalada pela razão entre a
++    # inadimplência PF corrente e a média histórica (BACEN SGS 21084, Fonte B),
++    # e os demais códigos renormalizados — hipótese declarada no DATA_CARD 3.
+     gateway_error_code = rng.choice(
+-        GATEWAY_ERROR_CODES, size=n_samples, p=ERROR_CODE_PROBS
++        GATEWAY_ERROR_CODES, size=n_samples, p=list(P["error_code_probs"])
+     )
+ 
+     # ── Bandeira do cartão ───────────────────────────────────────────
+@@ -145,13 +192,22 @@ def generate_dataset(n_samples: int = 3000, seed: Optional[int] = SEED) -> pd.Da
+     failure_count_90d = rng.poisson(lam=1.5, size=n_samples)
+ 
+     # ── Hora da tentativa de cobrança ────────────────────────────────
+-    hour_of_day = rng.choice(
+-        range(24), size=n_samples,
+-        p=_hour_distribution()
+-    )
++    # Default: curva desenhada à mão. Calibrado: histograma empírico da hora
++    # de `order_purchase_timestamp` nas 300 reais (proxy: hora de compra em
++    # e-commerce, não hora de cobrança de assinatura — declarado).
++    if P["hour_hist"] is None:
++        p_hora = _hour_distribution()
++    else:
++        p_hora = (np.asarray(P["hour_hist"], dtype=float)
++                  / np.sum(P["hour_hist"])).tolist()
++    hour_of_day = rng.choice(range(24), size=n_samples, p=p_hora)
+ 
+     # ── Dia da semana (0=seg, 6=dom) ─────────────────────────────────
+-    day_of_week = rng.integers(0, 7, size=n_samples)
++    if P["day_of_week_hist"] is None:
++        day_of_week = rng.integers(0, 7, size=n_samples)
++    else:
++        p_dow = np.asarray(P["day_of_week_hist"], dtype=float)
++        day_of_week = rng.choice(7, size=n_samples, p=p_dow / p_dow.sum())
+ 
+     # ── Número de tentativas anteriores ──────────────────────────────
+     attempt_count = rng.choice([1, 2, 3, 4], size=n_samples, p=[0.45, 0.30, 0.15, 0.10])
+@@ -178,9 +234,25 @@ def generate_dataset(n_samples: int = 3000, seed: Optional[int] = SEED) -> pd.Da
+         day_of_month=day_of_month,
+         attempt_count=attempt_count,
+         rng=rng,
++        ruido_sd=P["ruido_rotulo_sd"],
+     )
+     recovered = (rng.random(n_samples) < p_recovery).astype(int)
+ 
++    # ── Anti-circularidade: exceções à regra ─────────────────────────
++    # O rótulo já não é função determinística das features: `p_recovery` leva
++    # N(0, ruido_sd) e o rótulo é um sorteio Bernoulli(p) — com p entre 0,05
++    # e 0,95, a mesma linha pode cair dos dois lados, e é isso que segura a
++    # AUC do holdout em ~0,70 em vez de ~0,99. Em cima disso, no modo
++    # calibrado, uma fração `p_excecao_rotulo` das linhas tem o rótulo
++    # sorteado ao acaso, ignorando a regra: são os casos que nenhum modelo
++    # causal escrito à mão prevê (cliente que paga apesar de tudo, cliente que
++    # some sem motivo). A magnitude (2%) é deliberadamente pequena: o objetivo
++    # é impedir que o modelo decore a regra, não afogar o sinal — cada ponto
++    # de exceção custa AUC, e o gate G3 exige AUC >= 0,70.
++    if P["p_excecao_rotulo"] > 0:
++        excecao = rng.random(n_samples) < P["p_excecao_rotulo"]
++        recovered[excecao] = rng.integers(0, 2, size=int(excecao.sum()))
++
+     # ── Montar DataFrame ─────────────────────────────────────────────
+     df = pd.DataFrame({
+         "tenure_months": tenure_months,
+@@ -210,10 +282,16 @@ def _calculate_recovery_probability(
+     day_of_month: np.ndarray,
+     attempt_count: np.ndarray,
+     rng: np.random.Generator,
++    ruido_sd: float = 0.05,
+ ) -> np.ndarray:
+     """
+     Calcula probabilidade de recuperação com base em fatores realistas.
+     Modela as correlações que o XGBoost/RF devem aprender.
++
++    Cada coeficiente e sua hipótese de negócio estão em `docs/DATA_CARD.md`,
++    seção 7. `ruido_sd` é o desvio do ruído gaussiano somado ao final — o
++    default 0,05 é o que sempre existiu; o modo calibrado passa o valor do
++    `calibracao.json`.
+     """
+     n = len(tenure_months)
+     p = np.full(n, 0.5)
+@@ -251,7 +329,7 @@ def _calculate_recovery_probability(
+     p -= (attempt_count - 1) * 0.06
+ 
+     # Ruído aleatório para evitar separação perfeita
+-    p += rng.normal(0, 0.05, size=n)
++    p += rng.normal(0, ruido_sd, size=n)
+ 
+     return np.clip(p, 0.05, 0.95)
+ 
+@@ -280,6 +358,8 @@ def generate_behavioral_dataset(
+     n_samples: int = 5500,
+     anomaly_rate: float = 0.09,
+     seed: Optional[int] = SEED,
++    fonte: str = "sintetico",
++    parametros: Optional[dict] = None,
+ ) -> pd.DataFrame:
+     """
+     Gera snapshots de uso do produto para duas populações de clientes SaaS B2B.
+@@ -295,57 +375,111 @@ def generate_behavioral_dataset(
+         n_samples: Total de clientes gerados (saudáveis + anômalos)
+         anomaly_rate: Fração de clientes anômalos
+         seed: Seed para reprodutibilidade (default 42)
++        fonte: "sintetico" (default, inalterado) ou "sintetico_calibrado"
++        parametros: bloco `behavioral` de parâmetros, se quiser injetar um
+ 
+     Returns:
+         DataFrame com BEHAVIORAL_FEATURES + 'customer_id' + 'is_anomalous'
+     """
++    P = _parametros(fonte, parametros, "behavioral")
+     rng = np.random.default_rng(seed)
+ 
+     n_anomalous = int(round(n_samples * anomaly_rate))
+     n_healthy = n_samples - n_anomalous
+ 
+-    df = pd.concat(
+-        [
+-            _behavioral_population(n_healthy, rng, anomalous=False),
+-            _behavioral_population(n_anomalous, rng, anomalous=True),
+-        ],
+-        ignore_index=True,
+-    )
++    saudaveis = _behavioral_population(n_healthy, rng, anomalous=False, parametros=P)
++    anomalos = _behavioral_population(n_anomalous, rng, anomalous=True, parametros=P)
++
++    # ── Anti-circularidade: exceções ao rótulo ───────────────────────
++    # No default o rótulo `is_anomalous` É a população de origem, e as duas
++    # populações quase não se sobrepõem — daí o ROC-AUC 0,995 que o README
++    # marca como bandeira vermelha. No modo calibrado uma fração dos anômalos
++    # (`p_excecao_anomalo`) esconde o sinal: metade das features
++    # comportamentais vem da distribuição SAUDÁVEL (churn silencioso — o
++    # cliente que cancela sem dar sinal). E uma fração dos saudáveis
++    # (`p_excecao_saudavel`) mostra degradação passageira em 2 features
++    # (férias, projeto parado), sem ser anômalo. Com isso o rótulo deixa de
++    # ser dedutível das features; o autoencoder tem que aprender a geometria
++    # do normal, não uma fronteira que o gerador desenhou. Magnitudes (15% e
++    # 5%) no calibracao.json, com a justificativa lá.
++    if n_anomalous > 0 and P["p_excecao_anomalo"] > 0:
++        sombra = _behavioral_population(n_anomalous, rng, anomalous=False, parametros=P)
++        anomalos = _aplicar_excecoes(anomalos, sombra, P["p_excecao_anomalo"], 3, rng)
++    if n_healthy > 0 and P["p_excecao_saudavel"] > 0:
++        sombra = _behavioral_population(n_healthy, rng, anomalous=True, parametros=P)
++        saudaveis = _aplicar_excecoes(saudaveis, sombra, P["p_excecao_saudavel"], 2, rng)
++
++    df = pd.concat([saudaveis, anomalos], ignore_index=True)
+     return df.sample(frac=1.0, random_state=seed).reset_index(drop=True)
+ 
+ 
+-def _behavioral_population(n: int, rng: np.random.Generator, anomalous: bool) -> pd.DataFrame:
++# As features que uma "exceção" pode trocar pela outra população. Perfil de
++# conta (tenure/mrr/seats) fica de fora: ele já é igual nas duas populações.
++_FEATURES_EXCECAO = [
++    "logins_7d", "logins_30d", "feature_adoption", "avg_session_min",
++    "api_calls_7d", "days_since_last_login", "tickets_30d", "nps_last",
++]
++
++
++def _aplicar_excecoes(df: pd.DataFrame, sombra: pd.DataFrame, p: float,
++                      k: int, rng: np.random.Generator) -> pd.DataFrame:
++    """Em uma fração `p` das linhas, troca `k` features pelas da `sombra`."""
++    df = df.copy()
++    n = len(df)
++    alvo = np.where(rng.random(n) < p)[0]
++    for i in alvo:
++        cols = rng.choice(_FEATURES_EXCECAO, size=k, replace=False)
++        for col in cols:
++            df.at[i, col] = sombra.at[i, col]
++    return df
++
++
++def _behavioral_population(n: int, rng: np.random.Generator, anomalous: bool,
++                           parametros: Optional[dict] = None) -> pd.DataFrame:
+     """Uma das duas populações do dataset comportamental."""
+     if n <= 0:
+         return pd.DataFrame(columns=["customer_id", *BEHAVIORAL_FEATURES, "is_anomalous"])
+ 
++    P = (_calibracao.PARAMETROS_DISTRIBUICAO["behavioral"] if parametros is None
++         else parametros)
++    Q = P["anomalo"] if anomalous else P["saudavel"]
++
+     # Perfil de conta (tenure/MRR/seats) é idêntico nas duas populações:
+     # o que distingue o cliente anômalo é o COMPORTAMENTO, não o tamanho.
+     tenure_days = rng.gamma(shape=2.5, scale=180, size=n).clip(30, 2000).astype(int)
+     mrr_brl = rng.lognormal(mean=8.5, sigma=0.7, size=n).clip(500, 50_000).round(2)
+     seats = rng.poisson(lam=15, size=n).clip(1, 200)
+ 
++    # As quatro features com doador real (Fonte E, calibrado) leem de Q:
++    # days_since_last_login, avg_session_min, tickets_30d, nps_last.
++    # As demais não têm doador e continuam com os literais de sempre.
+     if anomalous:
+         logins_30d = rng.normal(loc=seats * 5, scale=seats * 2, size=n).clip(0).astype(int)
+         logins_7d = (logins_30d * rng.uniform(0.05, 0.15, size=n)).astype(int)
+         feature_adoption = rng.beta(a=2, b=5, size=n).round(3)
+-        avg_session_min = rng.normal(loc=6, scale=3, size=n).clip(0.5).round(1)
++        avg_session_min = rng.normal(loc=Q["avg_session"]["loc"], scale=Q["avg_session"]["scale"],
++                                     size=n).clip(0.5).round(1)
+         api_calls_7d = rng.lognormal(mean=4.5, sigma=1.0, size=n).clip(0).astype(int)
+-        days_since_last_login = rng.exponential(scale=9, size=n).clip(0, 30).astype(int)
+-        tickets_30d = rng.poisson(lam=4.5, size=n)
++        days_since_last_login = rng.exponential(scale=Q["days_since_last_login_scale"],
++                                                size=n).clip(0, 30).astype(int)
++        tickets_30d = rng.poisson(lam=Q["tickets_lam"], size=n)
+         failed_pay_90d = rng.binomial(n=3, p=0.35, size=n)
+-        nps_last = rng.normal(loc=5.5, scale=2.0, size=n).clip(0, 10).round(1)
++        nps_last = rng.normal(loc=Q["nps"]["loc"], scale=Q["nps"]["scale"],
++                              size=n).clip(0, 10).round(1)
+         prefixo = "A"
+     else:
+         logins_30d = rng.normal(loc=seats * 18, scale=seats * 3, size=n).clip(1).astype(int)
+         logins_7d = (logins_30d * rng.uniform(0.22, 0.30, size=n)).astype(int)
+         feature_adoption = rng.beta(a=5, b=2, size=n).round(3)
+-        avg_session_min = rng.normal(loc=22, scale=6, size=n).clip(2).round(1)
++        avg_session_min = rng.normal(loc=Q["avg_session"]["loc"], scale=Q["avg_session"]["scale"],
++                                     size=n).clip(2).round(1)
+         api_calls_7d = rng.lognormal(mean=7.0, sigma=0.8, size=n).clip(10).astype(int)
+-        days_since_last_login = rng.exponential(scale=1.5, size=n).clip(0, 30).astype(int)
+-        tickets_30d = rng.poisson(lam=1.2, size=n)
++        days_since_last_login = rng.exponential(scale=Q["days_since_last_login_scale"],
++                                                size=n).clip(0, 30).astype(int)
++        tickets_30d = rng.poisson(lam=Q["tickets_lam"], size=n)
+         failed_pay_90d = rng.binomial(n=3, p=0.05, size=n)
+-        nps_last = rng.normal(loc=8.2, scale=1.3, size=n).clip(0, 10).round(1)
++        nps_last = rng.normal(loc=Q["nps"]["loc"], scale=Q["nps"]["scale"],
++                              size=n).clip(0, 10).round(1)
+         prefixo = "C"
+ 
+     return pd.DataFrame({
+@@ -375,6 +509,8 @@ def generate_liquidity_series(
+     n_days: int = 180,
+     seed: Optional[int] = SEED,
+     end_date: Optional[Union[str, pd.Timestamp]] = None,
++    fonte: str = "sintetico",
++    parametros: Optional[dict] = None,
+ ) -> pd.DataFrame:
+     """
+     Gera o saldo diário de clientes SaaS B2B em 3 perfis de recebimento.
+@@ -388,17 +524,25 @@ def generate_liquidity_series(
+     seguintes ao dia de hoje. Em produção essas séries viriam do histórico de
+     transações do gateway / open finance.
+ 
++    NÃO existe doador público para saldo diário de cliente — nenhuma das
++    colunas deste gerador é calibrada em dado real, e o calibracao.json diz
++    isso. O que "sintetico_calibrado" muda aqui é só o anti-circularidade:
++    choques (salário atrasado, gasto imprevisto) que o default não tem.
++
+     Args:
+         n_customers: Número de clientes simulados
+         n_days: Dias de histórico por cliente
+         seed: Seed para reprodutibilidade (default 42)
+         end_date: Último dia da série (default: hoje)
++        fonte: "sintetico" (default, inalterado) ou "sintetico_calibrado"
++        parametros: bloco `liquidity` de parâmetros, se quiser injetar um
+ 
+     Returns:
+         DataFrame longo com uma linha por (cliente, dia):
+         customer_id, profile, date, day_of_month, weekday, bday_idx,
+         balance_norm, has_liquidity
+     """
++    P = _parametros(fonte, parametros, "liquidity")
+     rng = np.random.default_rng(seed)
+ 
+     fim = pd.Timestamp(end_date) if end_date is not None else pd.Timestamp(date.today())
+@@ -407,7 +551,7 @@ def generate_liquidity_series(
+ 
+     profiles = rng.choice(LIQUIDITY_PROFILES, size=n_customers, p=LIQUIDITY_PROFILE_PROBS)
+     series = [
+-        _liquidity_series_customer(f"C{i:05d}", profiles[i], dates, bday_idx, rng)
++        _liquidity_series_customer(f"C{i:05d}", profiles[i], dates, bday_idx, rng, P)
+         for i in range(n_customers)
+     ]
+     return pd.concat(series, ignore_index=True)
+@@ -426,8 +570,11 @@ def _liquidity_series_customer(
+     dates: pd.DatetimeIndex,
+     bday_idx: np.ndarray,
+     rng: np.random.Generator,
++    parametros: Optional[dict] = None,
+ ) -> pd.DataFrame:
+     """Série diária de saldo de um cliente, em múltiplos da mensalidade."""
++    P = (_calibracao.PARAMETROS_DISTRIBUICAO["liquidity"] if parametros is None
++         else parametros)
+     if profile == "CLT":
+         entradas = _entradas_clt(dates, bday_idx, rng)
+         gasto_diario = rng.uniform(0.08, 0.14)
+@@ -438,10 +585,26 @@ def _liquidity_series_customer(
+         entradas = _entradas_freelancer(dates, rng)
+         gasto_diario = rng.uniform(0.10, 0.20)
+ 
++    # ── Anti-circularidade (só no modo calibrado) ────────────────────
++    # `has_liquidity` é função determinística do saldo, e o saldo default é
++    # função quase determinística do calendário: a LSTM poderia aprender o
++    # calendário e nunca o cliente. Dois choques que o mundo real tem e a
++    # série default não: salário que atrasa alguns dias (p por entrada) e
++    # gasto imprevisto que zera a folga (p por dia). Magnitudes no
++    # calibracao.json. No default os dois são zero e nenhum sorteio extra
++    # acontece — a série é a mesma de sempre.
++    if P["p_atraso_salario"] > 0:
++        entradas = _atrasar_entradas(entradas, rng, P["p_atraso_salario"],
++                                     P["atraso_salario_max_dias"])
++
+     saldo = np.zeros(len(dates))
+     atual = rng.uniform(0.2, 1.5)  # saldo inicial em múltiplos da mensalidade
++    imprevisto = P["p_gasto_imprevisto"] > 0
+     for i in range(len(dates)):
+         atual = max(0.0, atual + entradas[i] - gasto_diario * rng.uniform(0.5, 1.5))
++        if imprevisto and rng.uniform() < P["p_gasto_imprevisto"]:
++            atual = max(0.0, atual - rng.uniform(P["gasto_imprevisto"]["min"],
++                                                 P["gasto_imprevisto"]["max"]))
+         saldo[i] = atual
+ 
+     return pd.DataFrame({
+@@ -478,6 +641,18 @@ def _entradas_pj(dates: pd.DatetimeIndex, rng: np.random.Generator) -> np.ndarra
+     return entradas
+ 
+ 
++def _atrasar_entradas(entradas: np.ndarray, rng: np.random.Generator,
++                      p: float, max_dias: int) -> np.ndarray:
++    """Cada entrada positiva tem probabilidade `p` de chegar 1..max_dias depois."""
++    saida = np.zeros_like(entradas)
++    for i in np.where(entradas > 0)[0]:
++        destino = i
++        if rng.uniform() < p:
++            destino = min(i + int(rng.integers(1, max_dias + 1)), len(entradas) - 1)
++        saida[destino] += entradas[i]
++    return saida
++
++
+ def _entradas_freelancer(dates: pd.DatetimeIndex, rng: np.random.Generator) -> np.ndarray:
+     """2-5 pagamentos por mês em dias aleatórios, valores erráticos."""
+     entradas = np.zeros(len(dates))
+@@ -492,6 +667,117 @@ def _entradas_freelancer(dates: pd.DatetimeIndex, rng: np.random.Generator) -> n
+     return entradas
+ 
+ 
++# ══════════════════════════════════════════════════════════════════════════
++# RISK SCORER VOLUNTÁRIO — DATASET DE RISCO (novo)
++# ══════════════════════════════════════════════════════════════════════════
++
++# Mesma ordem de `churn_voluntary.risk_scorer.FEATURES_DE_RISCO`. Repetida
++# aqui (e conferida por teste) para que este módulo não importe o scorer no
++# import — o scorer é importado sob demanda, só para computar o rótulo.
++VOLUNTARY_FEATURES = [
++    "days_since_last",
++    "features_used_30d",
++    "mrr",
++    "evento_cancelamento",
++    "evento_downgrade",
++    "evento_sessao",
++]
++
++_EVENTOS_VOLUNTARIOS = ["Session Started", "Downgrade Clicked", "Cancellation Page Viewed"]
++
++
++def generate_voluntary_dataset(
++    n_samples: int = 2000,
++    seed: Optional[int] = SEED,
++    fonte: str = "sintetico",
++    parametros: Optional[dict] = None,
++) -> pd.DataFrame:
++    """
++    Gera eventos de risco de churn voluntário com o rótulo das REGRAS FIXAS.
++
++    O que este gerador é, sem rodeios: não existe sinal real de cancelamento
++    em lugar nenhum do sistema (ver `churn_voluntary/README_treino.md`), então
++    o único rótulo defensável hoje é o que o próprio `risk_scorer` produz
++    pelas regras — mais ruído, para que um modelo treinado aprenda a
++    tendência e não decore a fórmula. Um modelo treinado aqui NÃO sabe mais
++    que as regras; ele prova que o encaixe plugável funciona de ponta a ponta.
++
++    - `days_since_last`: calibrado em `DaySinceLastOrder` (Fonte E)
++    - `features_used_30d`: proxy fraco de `OrderCount` (Fonte E)
++    - `mrr`: 100% sintético, sem doador
++    - one-hots de evento: mix declarado, sem doador
++    - `churn`: Bernoulli(regra + N(0, sd)), com `p_excecao_rotulo` de linhas
++      sorteadas ao acaso
++
++    Args:
++        n_samples: Número de eventos
++        seed: Seed para reprodutibilidade
++        fonte: "sintetico" ou "sintetico_calibrado"
++        parametros: bloco `voluntary` de parâmetros, se quiser injetar um
++
++    Returns:
++        DataFrame com VOLUNTARY_FEATURES + 'event' + 'risk_regra' + 'churn'
++    """
++    from ..churn_voluntary.risk_scorer import _risco_por_regras
++
++    P = _parametros(fonte, parametros, "voluntary")
++    rng = np.random.default_rng(seed)
++
++    days_since_last = _amostrar_inteiro(P["days_since_last"], n_samples, rng)
++    features_used_30d = _amostrar_inteiro(P["features_used_30d"], n_samples, rng)
++    mrr = np.clip(
++        rng.lognormal(mean=P["mrr_lognormal"]["mean"], sigma=P["mrr_lognormal"]["sigma"],
++                      size=n_samples),
++        P["mrr_lognormal"]["clip"][0], P["mrr_lognormal"]["clip"][1],
++    ).round(2)
++    mix = P["mix_eventos"]
++    eventos = rng.choice(_EVENTOS_VOLUNTARIOS, size=n_samples,
++                         p=[mix[e] for e in _EVENTOS_VOLUNTARIOS])
++
++    # O rótulo vem das regras REAIS do scorer, linha a linha — não de uma
++    # cópia. Se as regras mudarem, o dataset muda junto.
++    risk_regra = np.array([
++        _risco_por_regras(str(e), {"days_since_last": int(d), "features_used_30d": int(f)})
++        for e, d, f in zip(eventos, days_since_last, features_used_30d)
++    ], dtype=float)
++
++    # ── Anti-circularidade ───────────────────────────────────────────
++    # Regra + ruído gaussiano, corte em [0,02; 0,98] e sorteio Bernoulli: a
++    # mesma combinação de features cai dos dois lados. Em cima disso,
++    # `p_excecao_rotulo` das linhas recebe rótulo ao acaso. Magnitudes e
++    # justificativa no calibracao.json.
++    p = np.clip(risk_regra + rng.normal(0, P["ruido_rotulo_sd"], size=n_samples), 0.02, 0.98)
++    churn = (rng.random(n_samples) < p).astype(int)
++    if P["p_excecao_rotulo"] > 0:
++        excecao = rng.random(n_samples) < P["p_excecao_rotulo"]
++        churn[excecao] = rng.integers(0, 2, size=int(excecao.sum()))
++
++    return pd.DataFrame({
++        "days_since_last": days_since_last.astype(float),
++        "features_used_30d": features_used_30d.astype(float),
++        "mrr": mrr,
++        "evento_cancelamento": (eventos == "Cancellation Page Viewed").astype(float),
++        "evento_downgrade": (eventos == "Downgrade Clicked").astype(float),
++        "evento_sessao": (eventos == "Session Started").astype(float),
++        "event": eventos,
++        "risk_regra": risk_regra,
++        "churn": churn,
++    })
++
++
++def _amostrar_inteiro(spec: dict, n: int, rng: np.random.Generator) -> np.ndarray:
++    """Inteiros de uma spec: histograma empírico (calibrado) ou regra procedural."""
++    if spec.get("hist") is not None:
++        valores = np.asarray(spec["hist"]["valores"], dtype=int)
++        pesos = np.asarray(spec["hist"]["pesos"], dtype=float)
++        return rng.choice(valores, size=n, p=pesos / pesos.sum())
++    if spec["tipo"] == "uniforme_int":
++        return rng.integers(spec["min"], spec["max"] + 1, size=n)
++    if spec["tipo"] == "poisson":
++        return rng.poisson(lam=spec["lam"], size=n)
++    raise ValueError(f"spec de inteiro desconhecida: {spec}")
++
++
+ if __name__ == "__main__":
+     # Gerar e inspecionar dataset
+     df = generate_dataset(3000)
+diff --git a/app/crai/scripts/preparar_amostra_real.py b/app/crai/scripts/preparar_amostra_real.py
+index 249f844..78032f9 100644
+--- a/app/crai/scripts/preparar_amostra_real.py
++++ b/app/crai/scripts/preparar_amostra_real.py
+@@ -1,16 +1,23 @@
+ """crai/scripts/preparar_amostra_real.py — Âncora real do dataset sintético.
+ 
+-Constrói, de forma **determinística e auditável**, os dois artefatos de dados
+-reais que o Sprint 3 usa para calibrar `crai/ml/synthetic_data.py`:
++Constrói, de forma **determinística e auditável**, os artefatos de dados
++reais que calibram `crai/ml/synthetic_data.py`:
+ 
+     data/real/amostra_300.csv        Fonte A — 300 transações reais (Olist)
+     data/real/bacen_sgs_21084.json   Fonte B — inadimplência PF (BACEN SGS)
+     data/real/bacen_sgs_21129.json   Fonte B — inadimplência PF cartão
+-    data/real/PROVENIENCIA.json      hashes, contagens e parâmetros do sorteio
++    data/real/ecommerce_churn.csv    Fonte E — E-Commerce Customer Churn
++                                     (só as colunas usadas, 5.630 linhas)
++    data/real/PROVENIENCIA.json      hashes, contagens, parâmetros do sorteio
++                                     e a proveniência feature a feature
++    models/calibracao.json           os parâmetros MEDIDOS que o gerador lê
++                                     com fonte="sintetico_calibrado" (é o
++                                     único arquivo de models/ no git)
+ 
+-Rodar de `crai/`:
++Rodar de `app/`:
+ 
+     python -m crai.scripts.preparar_amostra_real
++    python -m crai.scripts.preparar_amostra_real --sem-rede   # só cache local
+ 
+ O script é idempotente: mesma seed, mesmas 300 linhas, mesmo SHA-256. É isso
+ que permite ao DATA_CARD afirmar *qual* amostra foi usada, e não apenas que
+@@ -26,20 +33,46 @@ FONTE A — Brazilian E-Commerce Public Dataset by Olist
+ 
+ FONTE B — BACEN, Sistema Gerenciador de Séries Temporais (SGS)
+     Licença Open Data Commons ODbL, API aberta, sem chave.
++    Se a API estiver fora de alcance (proxy corporativo, sem rede), o script
++    usa o JSON já em disco; se nem isso houver, usa os valores DECLARADOS no
++    DATA_CARD (§3) e grava na proveniência que fez isso.
++
++FONTE E — Ecommerce Customer Churn Analysis and Prediction (Kaggle,
++    ankitverma2010): 5.630 clientes de um e-commerce, 20 colunas, com rótulo
++    `Churn`. Licença não declarada na página do Kaggle: tratado como uso
++    acadêmico apenas — o bruto fica FORA do git, como a Olist. Mesma
++    convenção: espelho público + SHA-256 registrado. Mapeamento feature a
++    feature (fixo, não inventar outro):
++
++        DaySinceLastOrder  -> days_since_last (risk_scorer) e
++                              days_since_last_login (AnomalyDetector)
++        OrderCount         -> features_used_30d           (proxy fraco)
++        HourSpendOnApp     -> avg_session_min             (proxy fraco)
++        Complain           -> tickets_30d                 (proxy fraco)
++        SatisfactionScore  -> nps_last                    (proxy fraco)
++
++    O `Churn` real NÃO entra em nenhum parâmetro do gerador nem em nenhum
++    treino — é usado só na checagem fora do domínio (`scripts/sanity_check_
++    fora_do_dominio.py`), como rótulo que o modelo nunca viu.
+ """
+ 
+ import argparse
+ import hashlib
+ import json
+ import sys
++import urllib.error
+ import urllib.request
++from datetime import datetime, timezone
+ from pathlib import Path
+ 
+ import numpy as np
+ import pandas as pd
+ 
++from crai.ml import calibracao as _calib
++
+ BASE_DIR = Path(__file__).resolve().parent.parent.parent
+ DATA_REAL = BASE_DIR / "data" / "real"
++CALIBRACAO_PATH = _calib.CALIBRACAO_PATH
+ 
+ SEED_AMOSTRA = 42
+ N_AMOSTRA = 300
+@@ -54,6 +87,19 @@ ARQUIVOS_OLIST = (
+ SGS_URL = ("https://api.bcb.gov.br/dados/serie/bcdata.sgs.{serie}/dados"
+            "?formato=json&dataInicial=01/01/2020")
+ SERIES_SGS = (21084, 21129)
++# Valores da série 21084 declarados no DATA_CARD §3 (79 obs., 01/2020-07/2026).
++# Só entram quando a API E o cache local estão indisponíveis — e a proveniência
++# registra que entraram.
++SGS_21084_DECLARADO = {"media": 3.92, "ultimo": 5.81, "n_obs": 79}
++
++# Fonte E — espelho público do arquivo do Kaggle (mesmo xlsx, 5.630 linhas).
++ESPELHO_ECOMMERCE = ("https://raw.githubusercontent.com/JamshidSalimov/Ai-Fayls/"
++                     "master/E-Commerce-Dataset.xlsx")
++ARQUIVO_ECOMMERCE = "E-Commerce-Dataset.xlsx"
++PLANILHA_ECOMMERCE = "E Comm"
++COLUNAS_ECOMMERCE = ("Churn", "Tenure", "DaySinceLastOrder", "OrderCount",
++                     "HourSpendOnApp", "Complain", "SatisfactionScore")
++N_ECOMMERCE_ESPERADO = 5630
+ 
+ # `not_defined` são 3 linhas sem meio de pagamento declarado; valor zero é
+ # quitação integral por voucher. Nenhum dos dois informa a marginal de valor
+@@ -81,19 +127,53 @@ def baixar_olist(destino: Path) -> dict[str, str]:
+ 
+ 
+ def baixar_sgs() -> dict[int, int]:
+-    """Baixa as séries da Fonte B. Devolve {serie: nº de observações}."""
++    """Baixa as séries da Fonte B. Devolve {serie: nº de observações}.
++
++    Uma série que não puder ser baixada (API fora de alcance) fica com o JSON
++    que já estiver em disco, se houver, e devolve contagem None — quem chama
++    decide o que fazer com a ausência, e a proveniência registra.
++    """
+     DATA_REAL.mkdir(parents=True, exist_ok=True)
+     contagens = {}
+     for serie in SERIES_SGS:
+-        with urllib.request.urlopen(SGS_URL.format(serie=serie), timeout=60) as r:
+-            dados = json.loads(r.read().decode("utf-8"))
+         alvo = DATA_REAL / f"bacen_sgs_{serie}.json"
++        try:
++            with urllib.request.urlopen(SGS_URL.format(serie=serie), timeout=60) as r:
++                dados = json.loads(r.read().decode("utf-8"))
++        except (urllib.error.URLError, OSError, ValueError) as e:
++            print(f"[DADOS] SGS {serie}: API inacessivel ({e}); "
++                  f"{'usando cache em disco' if alvo.exists() else 'sem cache em disco'}")
++            contagens[serie] = None
++            continue
+         alvo.write_text(json.dumps(dados, ensure_ascii=False, indent=1), encoding="utf-8")
+         contagens[serie] = len(dados)
+         print(f"[DADOS] SGS {serie}: {len(dados)} observações -> {alvo.name}")
+     return contagens
+ 
+ 
++def baixar_ecommerce(destino: Path) -> str:
++    """Baixa o xlsx da Fonte E (se ainda não estiver em `destino`). Devolve o SHA-256."""
++    destino.mkdir(parents=True, exist_ok=True)
++    alvo = destino / ARQUIVO_ECOMMERCE
++    if not alvo.exists():
++        print(f"[DADOS] baixando {ARQUIVO_ECOMMERCE} …")
++        urllib.request.urlretrieve(ESPELHO_ECOMMERCE, alvo)
++    sha = _sha256(alvo)
++    print(f"[DADOS] {ARQUIVO_ECOMMERCE}: {alvo.stat().st_size} bytes | sha256 {sha[:16]}…")
++    return sha
++
++
++def montar_ecommerce(origem: Path) -> pd.DataFrame:
++    """As 7 colunas usadas da Fonte E, sem `CustomerID`, na ordem original das linhas."""
++    df = pd.read_excel(origem / ARQUIVO_ECOMMERCE, sheet_name=PLANILHA_ECOMMERCE)
++    faltam = [c for c in COLUNAS_ECOMMERCE if c not in df.columns]
++    if faltam:
++        raise ValueError(f"Fonte E sem as colunas {faltam} — arquivo errado?")
++    if len(df) != N_ECOMMERCE_ESPERADO:
++        raise ValueError(f"Fonte E com {len(df)} linhas; esperado {N_ECOMMERCE_ESPERADO}")
++    return df[list(COLUNAS_ECOMMERCE)].reset_index(drop=True)
++
++
+ def montar_populacao(origem: Path) -> pd.DataFrame:
+     """Junta pagamentos + timestamp do pedido + UF do cliente."""
+     pag = pd.read_csv(origem / "olist_order_payments_dataset.csv")
+@@ -167,10 +247,286 @@ def amostrar_estratificado(df: pd.DataFrame, n: int, seed: int) -> pd.DataFrame:
+     return amostra
+ 
+ 
++# ══════════════════════════════════════════════════════════════════════════
++# CALIBRAÇÃO — dos doadores reais para os parâmetros do gerador
++#
++# Cada função abaixo devolve (parametros, notas): `parametros` é o bloco que
++# `calibracao.parametros("sintetico_calibrado")` sobrepõe ao default, e
++# `notas` explica de onde veio cada número — vai para o JSON, não para um
++# comentário que ninguém lê.
++# ══════════════════════════════════════════════════════════════════════════
++
++def _histograma(valores: pd.Series, dominio: range, suavizacao: float = 0.5) -> list:
++    """Frequência relativa em `dominio`, com suavização aditiva.
++
++    Suavização de 0,5 por célula (Laplace/Jeffreys) para que um dia do mês
++    ou uma hora ausentes nas 300 linhas não fiquem com probabilidade ZERO —
++    300 linhas não sustentam a afirmação de que nunca se cobra às 4h.
++    """
++    contagem = valores.astype(int).value_counts()
++    pesos = np.array([contagem.get(v, 0) + suavizacao for v in dominio], dtype=float)
++    return (pesos / pesos.sum()).round(6).tolist()
++
++
++def taxa_base_sgs_21084(contagem_baixada) -> dict:
++    """Média histórica e último valor da série 21084 (Fonte B).
++
++    Ordem de preferência: JSON em disco (baixado agora ou antes) > valores
++    declarados no DATA_CARD. A origem usada fica no dicionário devolvido.
++    """
++    caminho = DATA_REAL / "bacen_sgs_21084.json"
++    if caminho.exists():
++        dados = json.loads(caminho.read_text(encoding="utf-8"))
++        serie = pd.to_numeric(pd.Series([d["valor"] for d in dados]), errors="coerce").dropna()
++        if len(serie):
++            return {
++                "media": round(float(serie.mean()), 4),
++                "ultimo": round(float(serie.iloc[-1]), 4),
++                "n_obs": int(len(serie)),
++                "origem": ("api_bcb (baixada nesta execucao)" if contagem_baixada
++                           else "cache local (json de execucao anterior)"),
++            }
++    return {**SGS_21084_DECLARADO,
++            "origem": "DECLARADO no DATA_CARD 3 — API e cache indisponiveis nesta execucao"}
++
++
++def calibrar_classifier(amostra: pd.DataFrame, sgs: dict) -> tuple[dict, dict]:
++    """Módulo 1: valor, sazonalidade (Fonte A) e peso de insufficient_funds (Fonte B)."""
++    log_valor = np.log(amostra["payment_value"].to_numpy(dtype=float))
++    mu, sigma = float(log_valor.mean()), float(log_valor.std(ddof=0))
++
++    razao = sgs["ultimo"] / sgs["media"]
++    base = list(_calib.PARAMETROS_DISTRIBUICAO["classifier"]["error_code_probs"])
++    idx = _calib.CODIGOS_DE_ERRO.index("insufficient_funds")
++    p_if = min(base[idx] * razao, 0.80)
++    resto = 1.0 - p_if
++    fator = resto / (1.0 - base[idx])
++    probs = [round(p_if if i == idx else base[i] * fator, 4) for i in range(len(base))]
++    probs[idx] = round(1.0 - sum(p for i, p in enumerate(probs) if i != idx), 4)
++
++    parametros = {
++        "invoice_lognormal": {"mean": round(mu, 4), "sigma": round(sigma, 4)},
++        "invoice_clip": [float(amostra["payment_value"].min()),
++                         float(amostra["payment_value"].max())],
++        "day_of_month_hist": _histograma(amostra["day_of_month"], range(1, 32)),
++        "hour_hist": _histograma(amostra["hour_of_day"], range(0, 24)),
++        "day_of_week_hist": _histograma(amostra["day_of_week"], range(0, 7)),
++        "error_code_probs": probs,
++        "ruido_rotulo_sd": 0.05,
++        "p_excecao_rotulo": 0.02,
++    }
++    notas = {
++        "invoice_lognormal": "MLE de log(payment_value) nas 300 reais (Fonte A). "
++                             "Mediana ~R$ 100: ticket de e-commerce, nao de SaaS B2B "
++                             "(DATA_CARD 2.3).",
++        "invoice_clip": "faixa observada nas 300 reais, no lugar de R$ 49,90-9.999,90",
++        "day_of_month_hist": "histograma empirico do dia de order_purchase_timestamp, "
++                             "suavizacao 0,5 por dia",
++        "hour_hist": "histograma empirico da hora de compra (proxy: hora de compra em "
++                     "e-commerce, nao hora de cobranca de assinatura)",
++        "day_of_week_hist": "histograma empirico do dia da semana da compra (proxy)",
++        "error_code_probs": f"fatia de insufficient_funds x {razao:.3f} "
++                            f"(ultimo/media da SGS 21084: {sgs['ultimo']}/{sgs['media']}, "
++                            f"origem: {sgs['origem']}); demais codigos renormalizados. "
++                            f"Hipotese declarada no DATA_CARD 3.",
++        "ruido_rotulo_sd": "N(0, 0,05) somado a p_recovery — o mesmo do default; nao e "
++                           "calibravel (nao existe rotulo real de recuperacao)",
++        "p_excecao_rotulo": "2% das linhas com rotulo sorteado ao acaso, ignorando a "
++                            "regra. Pequeno de proposito: cada ponto custa AUC e o gate "
++                            "G3 exige AUC >= 0,70; o objetivo e impedir que o modelo "
++                            "decore a formula, nao apagar o sinal",
++    }
++    return parametros, notas
++
++
++def calibrar_behavioral(ecom: pd.DataFrame) -> tuple[dict, dict]:
++    """Módulo 2: as 4 features com doador na Fonte E; o resto fica como está."""
++    P0 = _calib.PARAMETROS_DISTRIBUICAO["behavioral"]
++    dias = ecom["DaySinceLastOrder"].dropna()
++    horas = ecom["HourSpendOnApp"].dropna()
++    sat = ecom["SatisfactionScore"].dropna()
++
++    dias_saud = float(dias.mean())               # scale da exponencial = media
++    deslocamento = (P0["anomalo"]["days_since_last_login_scale"]
++                    - P0["saudavel"]["days_since_last_login_scale"])
++    cv_horas = float(horas.std(ddof=0) / horas.mean())
++    lam_saud = float(ecom.loc[ecom["Churn"] == 0, "Complain"].mean())
++    lam_anom = float(ecom.loc[ecom["Churn"] == 1, "Complain"].mean())
++    nps_loc_saud = float(sat.mean() * 2)          # 1-5 -> 0-10
++    nps_scale = float(sat.std(ddof=0) * 2)
++    razao_nps = P0["anomalo"]["nps"]["loc"] / P0["saudavel"]["nps"]["loc"]
++
++    parametros = {
++        "saudavel": {
++            "days_since_last_login_scale": round(dias_saud, 4),
++            "avg_session": {"loc": P0["saudavel"]["avg_session"]["loc"],
++                            "scale": round(P0["saudavel"]["avg_session"]["loc"] * cv_horas, 4)},
++            "tickets_lam": round(lam_saud, 4),
++            "nps": {"loc": round(nps_loc_saud, 4), "scale": round(nps_scale, 4)},
++        },
++        "anomalo": {
++            "days_since_last_login_scale": round(dias_saud + deslocamento, 4),
++            "avg_session": {"loc": P0["anomalo"]["avg_session"]["loc"],
++                            "scale": round(P0["anomalo"]["avg_session"]["loc"] * cv_horas, 4)},
++            "tickets_lam": round(lam_anom, 4),
++            "nps": {"loc": round(nps_loc_saud * razao_nps, 4), "scale": round(nps_scale, 4)},
++        },
++        "p_excecao_anomalo": 0.15,
++        "p_excecao_saudavel": 0.05,
++    }
++    notas = {
++        "days_since_last_login": f"saudavel: media de DaySinceLastOrder ({dias_saud:.3f} dias, "
++                                 f"n={len(dias)}) como scale da exponencial. Anomalo: saudavel "
++                                 f"+ {deslocamento:g} dias (o deslocamento que o gerador "
++                                 f"default ja tinha). O corte por Churn do doador NAO foi "
++                                 f"usado para separar as populacoes: nele quem cancela tem "
++                                 f"MENOS dias desde o ultimo pedido, o inverso da hipotese "
++                                 f"do gerador — declarado, nao escondido.",
++        "avg_session_min": f"proxy fraco: HourSpendOnApp e horas/dia no app, nao minutos por "
++                           f"sessao. Calibrado SO o coeficiente de variacao "
++                           f"({cv_horas:.4f}); a escala (22 / 6 min) continua inventada.",
++        "tickets_30d": f"proxy fraco: Complain e um flag 0/1, nao contagem de tickets. "
++                       f"lambda da Poisson = P(Complain) por populacao do doador "
++                       f"(Churn=0: {lam_saud:.4f}; Churn=1: {lam_anom:.4f}) — unica feature "
++                       f"em que a direcao do doador coincide com a do gerador.",
++        "nps_last": f"proxy fraco: SatisfactionScore 1-5 reescalado x2 para 0-10 "
++                    f"(saudavel: media {nps_loc_saud:.3f}, sd {nps_scale:.3f}). Anomalo: "
++                    f"media x {razao_nps:.4f} (razao do gerador default). No doador quem "
++                    f"cancela e MAIS satisfeito em media — direcao inversa, nao usada.",
++        "p_excecao_anomalo": "15% dos anomalos recebem 3 das 8 features comportamentais da "
++                             "distribuicao saudavel (churn silencioso)",
++        "p_excecao_saudavel": "5% dos saudaveis recebem 2 features da distribuicao anomala "
++                              "(degradacao passageira)",
++        "demais_features": "tenure_days, mrr_brl, seats, logins_7d, logins_30d, "
++                           "feature_adoption, api_calls_7d, failed_pay_90d: sem doador, "
++                           "literais de sempre",
++    }
++    return parametros, notas
++
++
++def calibrar_voluntary(ecom: pd.DataFrame) -> tuple[dict, dict]:
++    """risk_scorer voluntário: days_since_last e features_used_30d da Fonte E."""
++    dias = ecom["DaySinceLastOrder"].dropna().astype(int).value_counts().sort_index()
++    pedidos = ecom["OrderCount"].dropna().astype(int).value_counts().sort_index()
++    parametros = {
++        "days_since_last": {"tipo": "hist", "hist": {
++            "valores": [int(v) for v in dias.index], "pesos": [int(c) for c in dias.values]}},
++        "features_used_30d": {"tipo": "hist", "hist": {
++            "valores": [int(v) for v in pedidos.index], "pesos": [int(c) for c in pedidos.values]}},
++        "ruido_rotulo_sd": 0.08,
++        "p_excecao_rotulo": 0.03,
++    }
++    notas = {
++        "days_since_last": f"histograma empirico de DaySinceLastOrder (n={int(dias.sum())}, "
++                           f"0-46 dias) — mesma unidade da feature",
++        "features_used_30d": f"proxy fraco: OrderCount (pedidos acumulados, n={int(pedidos.sum())}) "
++                             f"no lugar de features distintas usadas em 30 dias",
++        "mrr": "sem doador: lognormal inventada (mean 7,5 / sigma 0,8, R$ 99-50.000)",
++        "mix_eventos": "sem doador: 85% Session Started / 10% Downgrade / 5% Cancellation",
++        "rotulo": "churn = Bernoulli(regras fixas do risk_scorer + N(0, 0,08)), com 3% de "
++                  "excecoes ao acaso. Nao e churn observado: e o que as regras dizem, com "
++                  "ruido suficiente para o modelo nao decorar a formula.",
++    }
++    return parametros, notas
++
++
++def calibrar_liquidity() -> tuple[dict, dict]:
++    """Módulo 3: sem doador. Só o anti-circularidade muda."""
++    parametros = {
++        "p_atraso_salario": 0.10,
++        "atraso_salario_max_dias": 5,
++        "p_gasto_imprevisto": 0.02,
++        "gasto_imprevisto": {"min": 0.5, "max": 1.5},
++    }
++    notas = {
++        "todas_as_features": "sem doador publico para saldo diario de cliente: perfis "
++                             "CLT/PJ/freelancer, ancoras de payday e gasto diario continuam "
++                             "inventados (DATA_CARD 6: 'nao calibravel')",
++        "p_atraso_salario": "10% das entradas chegam 1-5 dias depois: a LSTM nao pode "
++                            "aprender so o calendario",
++        "p_gasto_imprevisto": "2% dos dias com gasto extra de 0,5-1,5 mensalidade",
++    }
++    return parametros, notas
++
++
++def proveniencia_features(notas: dict) -> dict:
++    """A lista feature a feature que `train()` devolve e o README_treino puxa.
++
++    Status: "ancorada" (distribuição medida numa coluna real da mesma
++    natureza), "proxy_fraco" (coluna real parecida, unidade/domínio diferem),
++    "sintetica_sem_doador" (inventada — declarado, nunca omitido).
++    """
++    A, B, E = "A: Olist (300 transacoes)", "B: BACEN SGS 21084", "E: E-Commerce Customer Churn"
++
++    def f(feature, status, fonte=None, coluna=None, nota=""):
++        return {"feature": feature, "status": status, "fonte": fonte,
++                "coluna": coluna, "nota": nota}
++
++    n_cls = notas["classifier"]
++    n_beh = notas["behavioral"]
++    n_vol = notas["voluntary"]
++    return {
++        "FailureClassifier": [
++            f("tenure_months", "sintetica_sem_doador", nota="mistura exponencial+uniforme a mao"),
++            f("day_of_month", "ancorada", A, "order_purchase_timestamp.day", n_cls["day_of_month_hist"]),
++            f("invoice_amount", "ancorada", A, "payment_value", n_cls["invoice_lognormal"]),
++            f("avg_ticket", "proxy_fraco", A, "payment_value",
++              "derivada de invoice_amount x U(0,85; 1,15); a relacao ticket/fatura e inventada"),
++            f("gateway_error_code", "proxy_fraco", B, "serie 21084 (inadimplencia PF)",
++              n_cls["error_code_probs"]),
++            f("card_brand", "sintetica_sem_doador", nota="mix de bandeiras a mao"),
++            f("payment_history_score", "sintetica_sem_doador", nota="beta(5,2) + tenure, a mao"),
++            f("failure_count_90d", "sintetica_sem_doador", nota="poisson(1,5) a mao"),
++            f("hour_of_day", "proxy_fraco", A, "order_purchase_timestamp.hour", n_cls["hour_hist"]),
++            f("day_of_week", "proxy_fraco", A, "order_purchase_timestamp.dayofweek", n_cls["day_of_week_hist"]),
++            f("attempt_count", "sintetica_sem_doador", nota="mix 45/30/15/10 a mao"),
++            f("recovered (rotulo)", "sintetica_sem_doador",
++              nota="modelo causal declarado (DATA_CARD 7) + N(0, 0,05) + Bernoulli + "
++                   + n_cls["p_excecao_rotulo"]),
++        ],
++        "AnomalyDetector": [
++            f("tenure_days", "sintetica_sem_doador", nota="gamma(2,5; 180) a mao"),
++            f("mrr_brl", "sintetica_sem_doador", nota="lognormal(8,5; 0,7) a mao"),
++            f("seats", "sintetica_sem_doador", nota="poisson(15) a mao"),
++            f("logins_7d", "sintetica_sem_doador", nota="fracao de logins_30d a mao"),
++            f("logins_30d", "sintetica_sem_doador", nota="normal(seats x 18 / x 5) a mao"),
++            f("feature_adoption", "sintetica_sem_doador", nota="beta(5,2) / beta(2,5) a mao"),
++            f("avg_session_min", "proxy_fraco", E, "HourSpendOnApp", n_beh["avg_session_min"]),
++            f("api_calls_7d", "sintetica_sem_doador", nota="lognormal a mao"),
++            f("days_since_last_login", "ancorada", E, "DaySinceLastOrder", n_beh["days_since_last_login"]),
++            f("tickets_30d", "proxy_fraco", E, "Complain", n_beh["tickets_30d"]),
++            f("failed_pay_90d", "sintetica_sem_doador", nota="binomial(3; 0,05 / 0,35) a mao"),
++            f("nps_last", "proxy_fraco", E, "SatisfactionScore", n_beh["nps_last"]),
++            f("is_anomalous (rotulo)", "sintetica_sem_doador",
++              nota="populacao de origem; " + n_beh["p_excecao_anomalo"] + "; "
++                   + n_beh["p_excecao_saudavel"]),
++        ],
++        "PaydayInference": [
++            f("balance_norm", "sintetica_sem_doador", nota=notas["liquidity"]["todas_as_features"]),
++            f("has_liquidity (rotulo)", "sintetica_sem_doador", nota="saldo >= 1 mensalidade; "
++              + notas["liquidity"]["p_atraso_salario"] + "; " + notas["liquidity"]["p_gasto_imprevisto"]),
++            f("day_of_month (sin/cos)", "sintetica_sem_doador", nota="calendario"),
++            f("weekday", "sintetica_sem_doador", nota="calendario"),
++            f("profile (CLT/PJ/freelancer)", "sintetica_sem_doador", nota="mix 50/30/20 a mao"),
++        ],
++        "risk_scorer_voluntario": [
++            f("days_since_last", "ancorada", E, "DaySinceLastOrder", n_vol["days_since_last"]),
++            f("features_used_30d", "proxy_fraco", E, "OrderCount", n_vol["features_used_30d"]),
++            f("mrr", "sintetica_sem_doador", nota=n_vol["mrr"]),
++            f("evento_cancelamento", "sintetica_sem_doador", nota=n_vol["mix_eventos"]),
++            f("evento_downgrade", "sintetica_sem_doador", nota=n_vol["mix_eventos"]),
++            f("evento_sessao", "sintetica_sem_doador", nota=n_vol["mix_eventos"]),
++            f("churn (rotulo)", "sintetica_sem_doador", nota=n_vol["rotulo"]),
++        ],
++    }
++
++
+ def main(argv=None) -> int:
+     ap = argparse.ArgumentParser(description="Prepara a âncora real da CRAI")
+     ap.add_argument("--origem", type=Path, default=DATA_REAL / "_olist_bruto",
+                     help="diretório onde os CSVs da Fonte A ficam (baixa se faltar)")
++    ap.add_argument("--origem-ecommerce", type=Path, default=DATA_REAL / "_ecommerce_bruto",
++                    help="diretório onde o xlsx da Fonte E fica (baixa se faltar)")
+     ap.add_argument("--sem-rede", action="store_true",
+                     help="não baixa nada; usa o que já está em disco")
+     args = ap.parse_args(argv)
+@@ -180,9 +536,11 @@ def main(argv=None) -> int:
+     if args.sem_rede:
+         hashes = {n: _sha256(args.origem / n) for n in ARQUIVOS_OLIST}
+         contagens_sgs = {}
++        sha_ecom = _sha256(args.origem_ecommerce / ARQUIVO_ECOMMERCE)
+     else:
+         hashes = baixar_olist(args.origem)
+         contagens_sgs = baixar_sgs()
++        sha_ecom = baixar_ecommerce(args.origem_ecommerce)
+ 
+     populacao = montar_populacao(args.origem)
+     amostra = amostrar_estratificado(populacao, N_AMOSTRA, SEED_AMOSTRA)
+@@ -191,10 +549,21 @@ def main(argv=None) -> int:
+     amostra.to_csv(destino, index=False, encoding="utf-8")
+     sha_amostra = _sha256(destino)
+ 
+-    proveniencia = {
+-        "gerado_por": "crai/scripts/preparar_amostra_real.py",
+-        "seed": SEED_AMOSTRA,
+-        "n_amostra": int(len(amostra)),
++    ecom = montar_ecommerce(args.origem_ecommerce)
++    destino_ecom = DATA_REAL / "ecommerce_churn.csv"
++    ecom.to_csv(destino_ecom, index=False, encoding="utf-8")
++    sha_ecom_csv = _sha256(destino_ecom)
++
++    # ── Calibração ──────────────────────────────────────────────────
++    sgs = taxa_base_sgs_21084(contagens_sgs.get(21084))
++    p_cls, n_cls = calibrar_classifier(amostra, sgs)
++    p_beh, n_beh = calibrar_behavioral(ecom)
++    p_vol, n_vol = calibrar_voluntary(ecom)
++    p_liq, n_liq = calibrar_liquidity()
++    notas = {"classifier": n_cls, "behavioral": n_beh, "voluntary": n_vol, "liquidity": n_liq}
++    features = proveniencia_features(notas)
++
++    fontes = {
+         "fonte_a": {
+             "nome": "Brazilian E-Commerce Public Dataset by Olist",
+             "licenca": "CC BY-NC-SA 4.0 (nao comercial)",
+@@ -209,7 +578,34 @@ def main(argv=None) -> int:
+             "nome": "BACEN SGS",
+             "licenca": "ODbL",
+             "series": {str(s): contagens_sgs.get(s) for s in SERIES_SGS},
++            "serie_21084_usada": sgs,
++        },
++        "fonte_e": {
++            "nome": "Ecommerce Customer Churn Analysis and Prediction",
++            "licenca": "nao declarada na pagina do Kaggle — uso academico apenas, "
++                       "bruto fora do git",
++            "origem_canonica": "kaggle.com/datasets/ankitverma2010/"
++                               "ecommerce-customer-churn-analysis-and-prediction",
++            "espelho_usado": ESPELHO_ECOMMERCE,
++            "sha256_arquivo_bruto": sha_ecom,
++            "n_linhas": int(len(ecom)),
++            "colunas_usadas": list(COLUNAS_ECOMMERCE),
++            "nulos_por_coluna": {c: int(ecom[c].isna().sum()) for c in COLUNAS_ECOMMERCE},
++            "taxa_churn": round(float(ecom["Churn"].mean()), 4),
++            "describe": {c: {k: round(float(v), 4) for k, v in ecom[c].describe().items()}
++                         for c in COLUNAS_ECOMMERCE if c != "Churn"},
++            "arquivo_derivado": {"nome": destino_ecom.name, "sha256": sha_ecom_csv},
++            "papel_do_churn": "NAO entra em parametro nem em treino; so na checagem "
++                              "fora do dominio (scripts/sanity_check_fora_do_dominio.py)",
+         },
++    }
++
++    proveniencia = {
++        "gerado_por": "crai/scripts/preparar_amostra_real.py",
++        "gerado_em": datetime.now(timezone.utc).isoformat(timespec="seconds"),
++        "seed": SEED_AMOSTRA,
++        "n_amostra": int(len(amostra)),
++        **fontes,
+         "amostra": {
+             "arquivo": destino.name,
+             "sha256": sha_amostra,
+@@ -221,13 +617,42 @@ def main(argv=None) -> int:
+                 "max": float(amostra["payment_value"].max()),
+             },
+         },
++        "proveniencia_features": features,
+     }
+     (DATA_REAL / "PROVENIENCIA.json").write_text(
+         json.dumps(proveniencia, ensure_ascii=False, indent=2), encoding="utf-8")
+ 
++    calibracao = {
++        "gerado_por": "crai/scripts/preparar_amostra_real.py",
++        "gerado_em": proveniencia["gerado_em"],
++        "calibrado": True,
++        "fontes": {
++            "A": {"nome": fontes["fonte_a"]["nome"], "amostra_sha256": sha_amostra,
++                  "n": int(len(amostra))},
++            "B": {"nome": "BACEN SGS 21084", **sgs},
++            "E": {"nome": fontes["fonte_e"]["nome"], "sha256_bruto": sha_ecom,
++                  "n": int(len(ecom))},
++        },
++        "parametros": {"classifier": p_cls, "behavioral": p_beh,
++                       "liquidity": p_liq, "voluntary": p_vol},
++        "notas": notas,
++        "proveniencia_features": features,
++    }
++    CALIBRACAO_PATH.parent.mkdir(parents=True, exist_ok=True)
++    CALIBRACAO_PATH.write_text(
++        json.dumps(calibracao, ensure_ascii=False, indent=2), encoding="utf-8")
++
+     print(f"\n[DADOS] amostra: {len(amostra)} linhas -> {destino}")
+     print(f"[DADOS] sha256: {sha_amostra}")
+     print(f"[DADOS] mix: {proveniencia['amostra']['mix_payment_type']}")
++    print(f"[DADOS] fonte E: {len(ecom)} linhas -> {destino_ecom} (churn {fontes['fonte_e']['taxa_churn']:.1%})")
++    print(f"[DADOS] SGS 21084: media {sgs['media']} | ultimo {sgs['ultimo']} | {sgs['origem']}")
++    print(f"[CALIBRACAO] parametros medidos -> {CALIBRACAO_PATH}")
++    for modelo, linhas in features.items():
++        por_status = {}
++        for l in linhas:
++            por_status[l["status"]] = por_status.get(l["status"], 0) + 1
++        print(f"[CALIBRACAO]   {modelo:24s}: {por_status}")
+     return 0
+ 
+ 
+diff --git a/app/crai/scripts/train_all.py b/app/crai/scripts/train_all.py
+index d42a720..52f5a3a 100644
+--- a/app/crai/scripts/train_all.py
++++ b/app/crai/scripts/train_all.py
+@@ -8,19 +8,33 @@ resumo comparável dos três e verifica que cada modelo salvo é recarregável
+ via load() — é essa verificação que garante que o pipeline de inferência
+ (agente LangGraph) vai encontrar os artefatos no formato esperado.
+ 
++Desde o trabalho de base de dados/treino, aceita também:
++
++    --fonte sintetico|sintetico_calibrado   parâmetros do gerador (default:
++                                            sintetico — comportamento antigo)
++    --voluntario-samples N                  treina o CANDIDATO do risk_scorer
++                                            voluntário (0 desliga); nunca ativa
++    --ativar-voluntario                     promove o candidato ao nome que o
++                                            scorer carrega (muda o pipeline!)
++    --saida-json ARQUIVO                    grava todas as métricas da rodada
++
+ Uso:
+     python -m crai.scripts.train_all
+     python -m crai.scripts.train_all --quick        # amostras menores, para smoke test
++    python -m crai.scripts.train_all --fonte sintetico_calibrado --saida-json rodada.json
+ """
+ 
+ import argparse
+ import io
++import json
+ import sys
+ import time
+ 
+ from crai.ml.anomaly_detector import AnomalyDetector
++from crai.ml.calibracao import FONTES_ACEITAS
+ from crai.ml.failure_classifier import FailureClassifier, MODELS_DIR
+ from crai.ml.payday_inference import PaydayInference
++from crai.ml.voluntary_risk import VoluntaryRiskModel
+ 
+ LARGURA = 70
+ 
+@@ -31,32 +45,49 @@ def _cabecalho(titulo: str):
+     print(f"{'=' * LARGURA}")
+ 
+ 
+-def treinar_classifier(n_samples: int) -> dict:
++def treinar_classifier(n_samples: int, fonte: str = "sintetico") -> dict:
+     _cabecalho("MODULO 1/3 -- Failure Classifier (XGBoost + Random Forest + SHAP)")
+     clf = FailureClassifier()
+-    metrics = clf.train(n_samples=n_samples)
++    metrics = clf.train(n_samples=n_samples, fonte=fonte)
+     metrics["recarregavel"] = FailureClassifier().load()
+     return metrics
+ 
+ 
+-def treinar_anomaly(n_samples: int) -> dict:
++def treinar_anomaly(n_samples: int, fonte: str = "sintetico") -> dict:
+     _cabecalho("MODULO 2/3 -- Anomaly Detector (Autoencoder PyTorch)")
+     det = AnomalyDetector()
+-    metrics = det.train(n_samples=n_samples)
++    metrics = det.train(n_samples=n_samples, fonte=fonte)
+     metrics["recarregavel"] = AnomalyDetector().load()
+     return metrics
+ 
+ 
+-def treinar_payday(n_samples: int) -> dict:
++def treinar_payday(n_samples: int, fonte: str = "sintetico") -> dict:
+     _cabecalho("MODULO 3/3 -- Payday Inference (LSTM + Prophet)")
+     pay = PaydayInference()
+-    metrics = pay.train(n_samples=n_samples)
++    metrics = pay.train(n_samples=n_samples, fonte=fonte)
+     metrics["recarregavel"] = PaydayInference().load()
+     return metrics
+ 
+ 
+-def _resumo(classifier: dict, anomaly: dict, payday: dict):
++def treinar_voluntario(n_samples: int, fonte: str = "sintetico", ativar: bool = False) -> dict:
++    _cabecalho("EXTRA -- risk_scorer voluntario (candidato, GradientBoosting)")
++    vol = VoluntaryRiskModel()
++    metrics = vol.train(n_samples=n_samples, fonte=fonte)
++    metrics["recarregavel"] = VoluntaryRiskModel().load()
++    metrics["ativado"] = VoluntaryRiskModel.ativar() if ativar else False
++    return metrics
++
++
++def _resumo(classifier: dict, anomaly: dict, payday: dict, voluntario: dict = None):
+     _cabecalho("RESUMO DO TREINO")
++    print(f"\n  Fonte: {classifier['fonte_usada']} | amostras: classifier "
++          f"{classifier['n_amostras']} / anomaly {anomaly['n_amostras']} / "
++          f"payday {payday['n_amostras']}"
++          + (f" / voluntario {voluntario['n_amostras']}" if voluntario else ""))
++    for nome, m in (("classifier", classifier), ("anomaly", anomaly), ("payday", payday)):
++        p = m["proveniencia"]["por_status"]
++        print(f"  Proveniencia {nome:10s}: ancoradas {p['ancorada']} | proxy fraco "
++              f"{p['proxy_fraco']} | sinteticas puras {p['sintetica_sem_doador']}")
+ 
+     print("\n  [1] Failure Classifier -- ensemble XGBoost (70%) + Random Forest (30%)")
+     print(f"      AUC-ROC              : {classifier['auc']:.4f}")
+@@ -88,10 +119,26 @@ def _resumo(classifier: dict, anomaly: dict, payday: dict):
+         print(f"        {perfil:11s}: {v['mae_heuristica']:.2f} -> {v['mae_ensemble']:.2f} dias "
+               f"({v['n_janelas']} janelas)")
+ 
++    if voluntario:
++        print("\n  [extra] risk_scorer voluntario -- candidato (NAO ativo"
++              + (", ATIVADO nesta rodada" if voluntario.get("ativado") else "") + ")")
++        print(f"      AUC vs rotulo        : {voluntario['auc_vs_rotulo']:.4f} "
++              f"(teto das regras: {voluntario['auc_regra_vs_rotulo']:.4f})")
++        print(f"      Corr. com as regras  : {voluntario['corr_vs_regra']:.4f} | "
++              f"MAE vs regra {voluntario['mae_vs_regra']:.4f}")
++
++    versoes = classifier.get("versoes", {})
++    print(f"\n  Versoes gravadas no meta.json: sklearn {versoes.get('scikit-learn')} | "
++          f"xgboost {versoes.get('xgboost')} | torch {versoes.get('torch')} | "
++          f"prophet {versoes.get('prophet')}")
++
+     print(f"\n{'-' * LARGURA}")
+     print("  VERIFICACAO DE CARREGAMENTO (load() apos train())")
+     print(f"{'-' * LARGURA}")
+-    for nome, metrics in [("classifier", classifier), ("anomaly", anomaly), ("payday", payday)]:
++    modulos = [("classifier", classifier), ("anomaly", anomaly), ("payday", payday)]
++    if voluntario:
++        modulos.append(("voluntario", voluntario))
++    for nome, metrics in modulos:
+         status = "OK" if metrics["recarregavel"] else "FALHOU"
+         print(f"    {nome:12s}: {status}")
+ 
+@@ -110,31 +157,55 @@ def main():
+                         help="Clientes com serie de liquidez do Modulo 3 (default: 600)")
+     parser.add_argument("--quick", action="store_true",
+                         help="Amostras reduzidas para smoke test")
++    parser.add_argument("--fonte", choices=FONTES_ACEITAS, default="sintetico",
++                        help="Parametros do gerador sintetico (default: sintetico)")
++    parser.add_argument("--voluntario-samples", type=int, default=2000,
++                        help="Eventos sinteticos do candidato do risk_scorer voluntario "
++                             "(default: 2000; 0 desliga)")
++    parser.add_argument("--ativar-voluntario", action="store_true",
++                        help="Promove o candidato a voluntary_risk.joblib (o scorer passa "
++                             "a usar o modelo — muda o pipeline voluntario)")
++    parser.add_argument("--saida-json", type=str, default=None,
++                        help="Grava as metricas de todos os modulos neste arquivo")
+     args = parser.parse_args()
+ 
+     if args.quick:
+         args.classifier_samples = 500
+         args.anomaly_samples = 800
+         args.payday_customers = 60
++        if args.voluntario_samples:
++            args.voluntario_samples = 300
+ 
+     print(f"\n{'=' * LARGURA}")
+     print("  CRAI -- TREINO COMPLETO DOS MODELOS DE ML")
+     print(f"{'=' * LARGURA}")
+     print(f"  Artefatos serao salvos em: {MODELS_DIR}/")
++    print(f"  Fonte dos parametros: {args.fonte}")
+ 
+     inicio = time.perf_counter()
+-    classifier = treinar_classifier(args.classifier_samples)
+-    anomaly = treinar_anomaly(args.anomaly_samples)
+-    payday = treinar_payday(args.payday_customers)
++    classifier = treinar_classifier(args.classifier_samples, args.fonte)
++    anomaly = treinar_anomaly(args.anomaly_samples, args.fonte)
++    payday = treinar_payday(args.payday_customers, args.fonte)
++    voluntario = (treinar_voluntario(args.voluntario_samples, args.fonte, args.ativar_voluntario)
++                  if args.voluntario_samples else None)
+     duracao = time.perf_counter() - inicio
+ 
+-    _resumo(classifier, anomaly, payday)
++    _resumo(classifier, anomaly, payday, voluntario)
+ 
+-    todos_ok = all(m["recarregavel"] for m in (classifier, anomaly, payday))
++    modulos = [classifier, anomaly, payday] + ([voluntario] if voluntario else [])
++    todos_ok = all(m["recarregavel"] for m in modulos)
+     print(f"\n{'=' * LARGURA}")
+     print(f"  Tempo total: {duracao:.1f}s | Artefatos em: {MODELS_DIR}/")
+     print(f"{'=' * LARGURA}\n")
+ 
++    if args.saida_json:
++        with open(args.saida_json, "w", encoding="utf-8") as f:
++            json.dump({"fonte": args.fonte, "duracao_s": round(duracao, 1),
++                       "classifier": classifier, "anomaly": anomaly, "payday": payday,
++                       "voluntario": voluntario},
++                      f, ensure_ascii=False, indent=2, default=str)
++        print(f"  Metricas gravadas em {args.saida_json}\n")
++
+     return 0 if todos_ok else 1
+ 
+ 
+diff --git a/app/requirements.txt b/app/requirements.txt
+index f65d568..e45694d 100644
+--- a/app/requirements.txt
++++ b/app/requirements.txt
+@@ -37,9 +37,15 @@ joblib==1.4.2
+ # torch e prophet sao usados no treino dos Modulos 2 e 3 (autoencoder e LSTM).
+ # Sem eles, os dois modulos caem no fallback heuristico e o resto roda normal.
+ # Para CPU (suficiente para este projeto), instale o torch pelo indice de CPU:
+-#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+-torch>=2.3
+-prophet>=1.1
++#   pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cpu
++#
++# Versoes EXATAS (nao faixas): um .joblib/.pt gravado com uma versao e aberto
++# com outra carrega com aviso, carrega errado em silencio ou nao carrega. As
++# versoes usadas em cada treino ficam gravadas no meta.json do artefato
++# (`crai/ml/calibracao.versoes_bibliotecas`), e `load()` avisa nominalmente
++# quando o ambiente diverge. Os valores abaixo sao os do requirements-lock.txt.
++torch==2.13.0
++prophet==1.4.0
+ 
+ # ── Pagamentos ────────────────────────────────────────────
+ stripe==10.12.0

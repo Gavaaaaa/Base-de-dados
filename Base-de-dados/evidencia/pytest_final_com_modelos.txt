@@ -1,0 +1,4 @@
+=========================== short test summary info ============================
+FAILED tests/test_metricas_declaradas.py::TestOReadmeNaoMenteSobreOsModelos::test_a_auc_declarada_e_a_auc_medida
+FAILED tests/test_metricas_declaradas.py::TestOReadmeNaoMenteSobreOsModelos::test_a_auc_medida_esta_dentro_do_gate
+2 failed, 1042 passed, 909 warnings in 29.88s
